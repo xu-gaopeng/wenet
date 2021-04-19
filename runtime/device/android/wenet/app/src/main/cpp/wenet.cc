@@ -14,28 +14,23 @@
 #include <jni.h>
 #include <string>
 
-#include "glog/logging.h"
 #include "torch/script.h"
 #include "torch/torch.h"
 
-#include "decoder/symbol_table.h"
 #include "decoder/torch_asr_decoder.h"
 #include "decoder/torch_asr_model.h"
 #include "frontend/feature_pipeline.h"
 #include "frontend/wav.h"
+#include "utils/log.h"
 
 namespace wenet {
 
-std::shared_ptr<DecodeOptions> decode_config;
-std::shared_ptr<FeaturePipelineConfig> feature_config;
 std::shared_ptr<FeaturePipeline> feature_pipeline;
-std::shared_ptr<SymbolTable> symbol_table;
-std::shared_ptr<TorchAsrModel> model;
 std::shared_ptr<TorchAsrDecoder> decoder;
-bool finished = false;
+DecodeState state = DecodeState::kEndBatch;
 
 void init(JNIEnv *env, jobject, jstring jModelPath, jstring jDictPath) {
-  model = std::make_shared<TorchAsrModel>();
+  auto model = std::make_shared<TorchAsrModel>();
   const char *pModelPath = (env)->GetStringUTFChars(jModelPath, nullptr);
   std::string modelPath = std::string(pModelPath);
   LOG(INFO) << "model path: " << modelPath;
@@ -44,23 +39,24 @@ void init(JNIEnv *env, jobject, jstring jModelPath, jstring jDictPath) {
   const char *pDictPath = (env)->GetStringUTFChars(jDictPath, nullptr);
   std::string dictPath = std::string(pDictPath);
   LOG(INFO) << "dict path: " << dictPath;
-  symbol_table = std::make_shared<SymbolTable>(dictPath);
+  auto symbol_table = std::shared_ptr<fst::SymbolTable>(
+      fst::SymbolTable::ReadText(dictPath));
 
-  feature_config = std::make_shared<FeaturePipelineConfig>();
+  auto feature_config = std::make_shared<FeaturePipelineConfig>();
   feature_config->num_bins = 80;
   feature_pipeline = std::make_shared<FeaturePipeline>(*feature_config);
 
-  decode_config = std::make_shared<DecodeOptions>();
+  auto decode_config = std::make_shared<DecodeOptions>();
   decode_config->chunk_size = 16;
 
   decoder = std::make_shared<TorchAsrDecoder>(feature_pipeline, model,
-                                              *symbol_table, *decode_config);
+                                              symbol_table, *decode_config);
 }
 
 void reset(JNIEnv *env, jobject) {
   LOG(INFO) << "wenet reset";
   decoder->Reset();
-  finished = false;
+  state = DecodeState::kEndBatch;
 }
 
 void accept_waveform(JNIEnv *env, jobject, jshortArray jWaveform) {
@@ -80,13 +76,21 @@ void set_input_finished() {
 
 void decode_thread_func() {
   while (true) {
-    bool finish = decoder->Decode();
-    if (finish) {
-      LOG(INFO) << "wenet final result: " << decoder->result();
-      finished = true;
+    DecodeState state = decoder->Decode();
+
+    std::string result;
+    if (decoder->DecodedSomething()) {
+      result = decoder->result()[0].sentence;
+    }
+
+    if (state == DecodeState::kEndFeats) {
+      decoder->Rescoring();
+      LOG(INFO) << "wenet final result: " << result;
       break;
     } else {
-      LOG(INFO) << "wenet partial result: " << decoder->result();
+      if (decoder->DecodedSomething()) {
+        LOG(INFO) << "wenet partial result: " << result;
+      }
     }
   }
 }
@@ -97,15 +101,20 @@ void start_decode() {
 }
 
 jboolean get_finished(JNIEnv *env, jobject) {
-  if (finished) {
+  if (state == DecodeState::kEndFeats) {
     LOG(INFO) << "wenet recognize finished";
+    return JNI_TRUE;
   }
-  return finished ? JNI_TRUE : JNI_FALSE;
+  return JNI_FALSE;
 }
 
 jstring get_result(JNIEnv *env, jobject) {
-  LOG(INFO) << "wenet ui result: " << decoder->result();
-  return env->NewStringUTF(decoder->result().c_str());
+  std::string result;
+  if (decoder->DecodedSomething()) {
+    result = decoder->result()[0].sentence;
+    LOG(INFO) << "wenet ui result: " << result;
+  }
+  return env->NewStringUTF(result.c_str());
 }
 }  // namespace wenet
 
